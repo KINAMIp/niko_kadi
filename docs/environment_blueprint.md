@@ -58,17 +58,6 @@ This blueprint outlines the presentation layer goals for Tucheze Kadi across spl
   - Mic toggle for in-app voice chat (WebRTC).
   - Optional voice cues (“Pick two!”, “Niko Kadi!”).
 
-## Pop-Out System
-- Pop-outs only appear for relevant players and auto-dismiss on interaction or timer expiry.
-- **Timers:**
-
-| Pop-Out        | Visible To       | Duration | Timeout Result            |
-| -------------- | ---------------- | -------- | ------------------------- |
-| Niko Kadi      | Eligible player  | 5 s      | Hide badge, continue play |
-| Cancel Jump    | Other players    | 5 s      | Apply skip                |
-| Cancel Kickback| Other players    | 5 s      | Apply reverse             |
-
-- Pop-out timers pause the global turn countdown; play resumes immediately after resolution.
 
 ## Player Seating
 - Circular arrangement around the center pile with adjustable seat size.
