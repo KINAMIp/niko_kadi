@@ -1,506 +1,884 @@
+import 'dart:collection';
+
 import '../models/game_state.dart';
 import '../models/kadi_card.dart';
 import '../models/kadi_player.dart';
 
-class AceRequestPayload {
-  final Suit suit;
-  final Rank rank;
+const _ordinaryRanks = <Rank>{
+  Rank.four,
+  Rank.five,
+  Rank.six,
+  Rank.seven,
+  Rank.nine,
+  Rank.ten,
+};
 
-  const AceRequestPayload({required this.suit, required this.rank});
+const _penaltyRanks = <Rank>{
+  Rank.two,
+  Rank.three,
+  Rank.joker,
+};
 
-  String get label => '${rank.label}${suit == Suit.joker ? '' : suit.label[0]}';
+const _suitGlyphs = <Suit, String>{
+  Suit.clubs: '♣',
+  Suit.diamonds: '♦',
+  Suit.hearts: '♥',
+  Suit.spades: '♠',
+  Suit.joker: '🃏',
+};
+
+String _describeCard(KadiCard card) {
+  final glyph = _suitGlyphs[card.suit] ?? card.suit.name;
+  return '${card.rank.label}$glyph';
 }
 
-class PlayIntent {
-  final String playerId;
-  final List<KadiCard> cards;
-  final AceRequestPayload? aceRequest;
+String _describeSuit(Suit suit) => _suitGlyphs[suit] ?? suit.name;
 
-  const PlayIntent({
-    required this.playerId,
-    required this.cards,
-    this.aceRequest,
+class AceRequest {
+  final String requesterId;
+  final Rank rank;
+  final Suit suit;
+
+  const AceRequest({
+    required this.requesterId,
+    required this.rank,
+    required this.suit,
   });
+}
+
+class JumpWindow {
+  final String initiatorId;
+  final int skipCount;
+  final DateTime expiresAt;
+
+  const JumpWindow({
+    required this.initiatorId,
+    required this.skipCount,
+    required this.expiresAt,
+  });
+
+  JumpWindow copyWith({
+    String? initiatorId,
+    int? skipCount,
+    DateTime? expiresAt,
+  }) {
+    return JumpWindow(
+      initiatorId: initiatorId ?? this.initiatorId,
+      skipCount: skipCount ?? this.skipCount,
+      expiresAt: expiresAt ?? this.expiresAt,
+    );
+  }
+}
+
+class KickWindow {
+  final String initiatorId;
+  final int toggleCount;
+  final DateTime expiresAt;
+
+  const KickWindow({
+    required this.initiatorId,
+    required this.toggleCount,
+    required this.expiresAt,
+  });
+
+  KickWindow copyWith({
+    String? initiatorId,
+    int? toggleCount,
+    DateTime? expiresAt,
+  }) {
+    return KickWindow(
+      initiatorId: initiatorId ?? this.initiatorId,
+      toggleCount: toggleCount ?? this.toggleCount,
+      expiresAt: expiresAt ?? this.expiresAt,
+    );
+  }
+}
+
+class RuleState {
+  final Suit? forcedSuit;
+  final AceRequest? aceRequest;
+  final int pendingDraw;
+  final String? penaltyStarterId;
+  final bool clockwise;
+  final int skipCount;
+  final JumpWindow? jumpWindow;
+  final KickWindow? kickWindow;
+  final Set<String> nikoPending;
+  final Set<String> nikoDeclared;
+  final bool waitingForWinnerConfirmation;
+
+  const RuleState({
+    this.forcedSuit,
+    this.aceRequest,
+    this.pendingDraw = 0,
+    this.penaltyStarterId,
+    this.clockwise = true,
+    this.skipCount = 0,
+    this.jumpWindow,
+    this.kickWindow,
+    Set<String>? nikoPending,
+    Set<String>? nikoDeclared,
+    this.waitingForWinnerConfirmation = false,
+  })  : nikoPending = nikoPending ?? const <String>{},
+        nikoDeclared = nikoDeclared ?? const <String>{};
+
+  RuleState copyWith({
+    Suit? forcedSuit,
+    bool clearForcedSuit = false,
+    AceRequest? aceRequest,
+    bool clearAceRequest = false,
+    int? pendingDraw,
+    String? penaltyStarterId,
+    bool clearPenaltyStarter = false,
+    bool? clockwise,
+    int? skipCount,
+    JumpWindow? jumpWindow,
+    bool clearJumpWindow = false,
+    KickWindow? kickWindow,
+    bool clearKickWindow = false,
+    Set<String>? nikoPending,
+    Set<String>? nikoDeclared,
+    bool? waitingForWinnerConfirmation,
+  }) {
+    return RuleState(
+      forcedSuit: clearForcedSuit
+          ? null
+          : (forcedSuit ?? this.forcedSuit),
+      aceRequest: clearAceRequest ? null : (aceRequest ?? this.aceRequest),
+      pendingDraw: pendingDraw ?? this.pendingDraw,
+      penaltyStarterId: clearPenaltyStarter
+          ? null
+          : (penaltyStarterId ?? this.penaltyStarterId),
+      clockwise: clockwise ?? this.clockwise,
+      skipCount: skipCount ?? this.skipCount,
+      jumpWindow: clearJumpWindow ? null : (jumpWindow ?? this.jumpWindow),
+      kickWindow: clearKickWindow ? null : (kickWindow ?? this.kickWindow),
+      nikoPending: nikoPending ?? this.nikoPending,
+      nikoDeclared: nikoDeclared ?? this.nikoDeclared,
+      waitingForWinnerConfirmation:
+          waitingForWinnerConfirmation ?? this.waitingForWinnerConfirmation,
+    );
+  }
+
+  factory RuleState.fromGame(GameState game) {
+    AceRequest? request;
+    if (game.requestedRank != null &&
+        game.requestedCardSuit != null &&
+        game.aceRequesterId != null &&
+        game.aceRequesterId!.isNotEmpty) {
+      request = AceRequest(
+        requesterId: game.aceRequesterId!,
+        rank: game.requestedRank!,
+        suit: game.requestedCardSuit!,
+      );
+    }
+    JumpWindow? jump;
+    if (game.jumpInitiatorId != null &&
+        game.jumpExpiresAt != null &&
+        game.pendingJumpSkips > 0) {
+      jump = JumpWindow(
+        initiatorId: game.jumpInitiatorId!,
+        skipCount: game.pendingJumpSkips,
+        expiresAt: game.jumpExpiresAt!,
+      );
+    }
+    KickWindow? kick;
+    if (game.kickInitiatorId != null &&
+        game.kickExpiresAt != null &&
+        game.pendingKickToggles > 0) {
+      kick = KickWindow(
+        initiatorId: game.kickInitiatorId!,
+        toggleCount: game.pendingKickToggles,
+        expiresAt: game.kickExpiresAt!,
+      );
+    }
+    return RuleState(
+      forcedSuit: game.requiredSuit,
+      aceRequest: request,
+      pendingDraw: game.pendingDraw,
+      penaltyStarterId: game.penaltyStarterId,
+      clockwise: game.clockwise,
+      skipCount: game.skipCount,
+      jumpWindow: jump,
+      kickWindow: kick,
+      nikoPending: game.nikoPending.toSet(),
+      nikoDeclared: game.nikoDeclared.toSet(),
+      waitingForWinnerConfirmation: game.waitingForWinnerConfirmation,
+    );
+  }
+
+  GameState apply(GameState game) {
+    return game.copyWith(
+      requiredSuit: forcedSuit,
+      requestedRank: aceRequest?.rank,
+      requestedCardSuit: aceRequest?.suit,
+      aceRequesterId: aceRequest?.requesterId,
+      pendingDraw: pendingDraw,
+      penaltyStarterId: penaltyStarterId,
+      clockwise: clockwise,
+      skipCount: skipCount,
+      pendingJumpSkips: jumpWindow?.skipCount ?? 0,
+      jumpInitiatorId: jumpWindow?.initiatorId,
+      jumpExpiresAt: jumpWindow?.expiresAt,
+      pendingKickToggles: kickWindow?.toggleCount ?? 0,
+      kickInitiatorId: kickWindow?.initiatorId,
+      kickExpiresAt: kickWindow?.expiresAt,
+      nikoPending: nikoPending.toList(),
+      nikoDeclared: nikoDeclared.toList(),
+      waitingForWinnerConfirmation: waitingForWinnerConfirmation,
+      questionSuit: null,
+      questionAnswerRank: null,
+      requiredJokerColor: null,
+      comboOwnerId: null,
+      comboRank: null,
+    );
+  }
 }
 
 class RuleOutcome {
   final bool isValid;
-  final String? error;
-  final GameState? state;
+  final String? reason;
+  final RuleState state;
   final List<String> timeline;
-  final String? prompt;
+  final String? instruction;
+  final bool advanceTurn;
+  final bool startJumpTimer;
+  final bool startKickTimer;
 
   const RuleOutcome._({
     required this.isValid,
-    this.error,
-    this.state,
-    this.timeline = const [],
-    this.prompt,
+    required this.state,
+    required this.timeline,
+    this.reason,
+    this.instruction,
+    this.advanceTurn = true,
+    this.startJumpTimer = false,
+    this.startKickTimer = false,
   });
 
-  factory RuleOutcome.invalid(String message) =>
-      RuleOutcome._(isValid: false, error: message);
+  factory RuleOutcome.invalid(RuleState state, String reason) {
+    return RuleOutcome._(
+      isValid: false,
+      state: state,
+      timeline: const [],
+      reason: reason,
+      advanceTurn: false,
+    );
+  }
 
-  factory RuleOutcome.success({
-    required GameState state,
-    List<String> timeline = const [],
-    String? prompt,
-  }) =>
-      RuleOutcome._(
-        isValid: true,
-        state: state,
-        timeline: timeline,
-        prompt: prompt,
-      );
+  factory RuleOutcome.valid({
+    required RuleState state,
+    List<String>? timeline,
+    String? instruction,
+    bool advanceTurn = true,
+    bool startJumpTimer = false,
+    bool startKickTimer = false,
+  }) {
+    return RuleOutcome._(
+      isValid: true,
+      state: state,
+      timeline: timeline ?? const [],
+      instruction: instruction,
+      advanceTurn: advanceTurn,
+      startJumpTimer: startJumpTimer,
+      startKickTimer: startKickTimer,
+    );
+  }
 }
 
 class RuleEngine {
   const RuleEngine();
 
-  RuleOutcome play(GameState state, PlayIntent intent) {
-    if (state.gameStatus != 'playing') {
-      return RuleOutcome.invalid('Game is not in a playable state.');
-    }
-
-    if (state.isWaitingForCancel) {
-      return RuleOutcome.invalid('A cancel window is active. Resolve it first.');
-    }
-
-    final playerIndex = state.players.indexWhere((p) => p.uid == intent.playerId);
-    if (playerIndex == -1) {
-      return RuleOutcome.invalid('Player not part of the game.');
-    }
-
-    if (playerIndex != state.turnIndex) {
-      return RuleOutcome.invalid("It's not your turn.");
-    }
-
-    if (intent.cards.isEmpty) {
-      return RuleOutcome.invalid('You must play at least one card.');
-    }
-
-    final player = state.players[playerIndex];
-    final handIds = player.hand.map((e) => e.id).toSet();
-    for (final card in intent.cards) {
-      if (!handIds.contains(card.id)) {
-        return RuleOutcome.invalid('Attempted to play a card that is not in hand.');
-      }
-    }
-
-    final ctx = _PlayContext(state: state, player: player, intent: intent);
-    final validator = _PlayValidator(ctx);
-    final validationError = validator.validate();
-    if (validationError != null) {
-      return RuleOutcome.invalid(validationError);
-    }
-
-    return RuleOutcome.success(
-      state: validator.apply(),
-      timeline: validator.timeline,
-      prompt: validator.prompt,
-    );
-  }
-}
-
-class _PlayContext {
-  final GameState state;
-  final KadiPlayer player;
-  final PlayIntent intent;
-
-  _PlayContext({
-    required this.state,
-    required this.player,
-    required this.intent,
-  });
-}
-
-class _PlayValidator {
-  final _PlayContext ctx;
-  final List<String> timeline = [];
-  String? prompt;
-
-  _PlayValidator(this.ctx);
-
-  GameState get state => ctx.state;
-  KadiPlayer get player => ctx.player;
-  List<KadiCard> get cards => ctx.intent.cards;
-
-  String? validate() {
-    if (state.pendingWin != null) {
-      return 'Waiting for win confirmation.';
-    }
-
-    if (state.aceRequest != null) {
-      final error = _validateAceRequestResponse();
-      if (error != null) return error;
-      return null;
-    }
-
-    if (state.penaltyState.isActive) {
-      final error = _validatePenaltyPlay();
-      if (error != null) return error;
-      return null;
-    }
-
-    return _validateNormalPlay();
-  }
-
-  String? _validateAceRequestResponse() {
-    if (cards.length != 1) {
-      return 'Only one card may be played in response to an Ace request.';
-    }
-    final request = state.aceRequest!;
-    if (request.targetPlayer != player.uid) {
-      return 'Ace request is aimed at another player.';
-    }
-    final card = cards.first;
-    if (card.isAce) {
-      return null;
-    }
-    if (card.suit == request.suit && card.rank == request.rank) {
-      return null;
-    }
-    return 'You must play the requested card or another Ace.';
-  }
-
-  String? _validatePenaltyPlay() {
-    for (final card in cards) {
-      if (!card.isPenaltyCard && !card.isAce) {
-        return 'Only penalty cards or Aces can be played during a penalty chain.';
-      }
-    }
-    if (cards.length == 1 && cards.first.isAce) {
-      return null;
-    }
-
-    KadiCard previous = state.penaltyState.lastPenalty ?? state.topCard!;
-    for (final card in cards) {
-      if (!card.isPenaltyCard) {
-        return 'All cards must keep the penalty chain going.';
-      }
-      if (!_penaltyMatches(previous, card)) {
-        return 'Penalty cards must match by suit, rank, or color.';
-      }
-      previous = card;
-    }
-    return null;
-  }
-
-  bool _penaltyMatches(KadiCard top, KadiCard next) {
-    if (top.isJoker && next.isJoker) {
-      return top.color == next.color;
-    }
-    if (top.isJoker) {
-      return next.color == top.color;
-    }
-    if (next.isJoker) {
-      return next.color == top.color;
-    }
-    return top.rank == next.rank || top.suit == next.suit;
-  }
-
-  String? _validateNormalPlay() {
-    final top = state.topCard;
-    if (top == null) {
-      return 'Deck has not been initialised yet.';
-    }
-
-    if (cards.first.isPenaltyCard) {
-      return _validatePenaltyStarter(top);
-    }
-
-    if (cards.first.isAceOfSpades) {
-      if (cards.length != 1) {
-        return 'Ace of Spades must be played alone.';
-      }
-      if (ctx.intent.aceRequest == null) {
-        return 'Ace of Spades requires a requested card.';
-      }
-      return null;
-    }
-
-    if (cards.first.isAce) {
-      if (cards.length != 1) {
-        return 'Aces must be played individually.';
-      }
-      return null;
-    }
-
-    if (cards.first.isQuestionCard) {
-      return _validateQuestionCombo(top);
-    }
-
-    if (cards.first.isSkip) {
-      return _validateJumpCombo(top);
-    }
-
-    if (cards.first.isReverse) {
-      return _validateKickCombo(top);
-    }
-
-    return _validateOrdinaryCombo(top);
-  }
-
-  String? _validatePenaltyStarter(KadiCard top) {
-    if (!cards.first.matches(top, requiredSuit: state.requiredSuit)) {
-      return 'Penalty card must match the pile.';
-    }
-    KadiCard previous = cards.first;
-    for (final card in cards.skip(1)) {
-      if (!card.isPenaltyCard) {
-        return 'Penalty combos may contain only 2s, 3s, or Jokers.';
-      }
-      if (!_penaltyMatches(previous, card)) {
-        return 'Penalty cards must match by suit, rank, or color.';
-      }
-      previous = card;
-    }
-    return null;
-  }
-
-  String? _validateQuestionCombo(KadiCard top) {
-    if (!cards.first.matches(top, requiredSuit: state.requiredSuit)) {
-      return 'First question card must match the pile.';
-    }
-    final questions = cards.takeWhile((c) => c.rank == cards.first.rank).toList();
-    final answers = cards.skip(questions.length).toList();
-    if (answers.isEmpty) {
-      return 'Question cards must be followed by an answer.';
-    }
-    final lastQuestion = questions.last;
-    if (!answers.first.isOrdinary) {
-      return 'Answers must be ordinary cards.';
-    }
-    if (answers.first.suit != lastQuestion.suit) {
-      return 'First answer must follow the last question suit.';
-    }
-    final answerRank = answers.first.rank;
-    for (final answer in answers) {
-      if (!answer.isOrdinary) {
-        return 'Answers must be ordinary cards.';
-      }
-      if (answer.rank != answerRank) {
-        return 'All answers must share the same rank.';
-      }
-    }
-    for (final q in questions.skip(1)) {
-      if (q.rank != questions.first.rank) {
-        return 'All question cards must have the same rank.';
-      }
-    }
-    return null;
-  }
-
-  String? _validateJumpCombo(KadiCard top) {
-    if (!cards.first.matches(top, requiredSuit: state.requiredSuit)) {
-      return 'Jump must match the pile.';
-    }
-    for (final card in cards) {
-      if (!card.isSkip) {
-        return 'Jump combos may contain only Jacks.';
-      }
-    }
-    return null;
-  }
-
-  String? _validateKickCombo(KadiCard top) {
-    if (!cards.first.matches(top, requiredSuit: state.requiredSuit)) {
-      return 'Kickback must match the pile.';
-    }
-    for (final card in cards) {
-      if (!card.isReverse) {
-        return 'Kickback combos may contain only Kings.';
-      }
-    }
-    return null;
-  }
-
-  String? _validateOrdinaryCombo(KadiCard top) {
-    if (!cards.first.matches(top, requiredSuit: state.requiredSuit)) {
-      return 'First card must match by suit or rank.';
-    }
-    final rank = cards.first.rank;
-    for (final card in cards.skip(1)) {
-      if (card.rank != rank) {
-        return 'Combos must share the same rank.';
-      }
-      if (!card.isOrdinary) {
-        return 'Only ordinary cards may be part of the combo.';
-      }
-    }
-    return null;
-  }
-
-  GameState apply() {
-    final activeRequest = state.aceRequest;
-    var nextState = state;
-    final updatedPlayers = List<KadiPlayer>.from(state.players);
-    final playerIndex = updatedPlayers.indexWhere((p) => p.uid == player.uid);
-    final newHand = List<KadiCard>.from(player.hand);
-    for (final card in cards) {
-      newHand.removeWhere((c) => c.id == card.id);
-    }
-    updatedPlayers[playerIndex] = player.copyWith(hand: newHand);
-
-    final discard = List<KadiCard>.from(state.discardPile)..addAll(cards);
-
-    nextState = nextState.copyWith(
-      players: updatedPlayers,
-      discardPile: discard,
-      requiredSuit: null,
-      overrideTopCard: null,
-      aceRequest: null,
-      statusMessage: null,
-    );
-
-    if (activeRequest != null) {
-      if (cards.first.isAce) {
-        timeline.add('${player.name} canceled the request with an Ace.');
-      } else {
-        timeline.add(
-            '${player.name} honored the request with ${cards.first.rank.label}${cards.first.suit.label[0]}.');
-      }
-    }
-
-    if (state.penaltyState.isActive) {
-      if (cards.first.isAce) {
-        timeline.add('${player.name} canceled the penalty.');
-        final previous = state.penaltyState.lastPenalty;
-        final matchCard = previous ?? state.topCard;
-        nextState = nextState.copyWith(
-          penaltyState: const PenaltyState(),
-          overrideTopCard: previous,
-          statusMessage: matchCard == null
-              ? null
-              : 'Penalty cleared. Match ${matchCard.rank.label}${matchCard.suit.label[0]}.',
-        );
-        return _completeTurn(nextState);
-      }
-      final pending = state.penaltyState.pendingDraw +
-          cards.fold<int>(0, (sum, c) => sum + c.penaltyValue);
-      final stack = List<KadiCard>.from(state.penaltyState.stack)..addAll(cards);
-      timeline.add(
-          '${player.name} stacked a penalty. Pending draw is now $pending.');
-      nextState = nextState.copyWith(
-        penaltyState: state.penaltyState.copyWith(
-          pendingDraw: pending,
-          stack: stack,
-        ),
-        statusMessage:
-            'Pending draw $pending. Next player must continue penalty or pick.',
+  RuleOutcome play({
+    required GameState game,
+    required KadiPlayer player,
+    required List<KadiCard> cards,
+    AceRequest? aceRequest,
+  }) {
+    if (cards.isEmpty) {
+      return RuleOutcome.invalid(
+        RuleState.fromGame(game),
+        'Select at least one card.',
       );
-      return _completeTurn(nextState);
+    }
+
+    final ruleState = RuleState.fromGame(game);
+
+    if (ruleState.waitingForWinnerConfirmation) {
+      return RuleOutcome.invalid(
+        ruleState,
+        'Round review in progress — wait for confirmations.',
+      );
+    }
+
+    final now = DateTime.now();
+    final top = game.discardPile.isNotEmpty
+        ? game.discardPile.last
+        : game.drawPile.last;
+
+    if (ruleState.jumpWindow != null && now.isBefore(ruleState.jumpWindow!.expiresAt)) {
+      return _handleJumpCancel(ruleState, player, cards);
+    }
+    if (ruleState.kickWindow != null && now.isBefore(ruleState.kickWindow!.expiresAt)) {
+      return _handleKickCancel(ruleState, player, cards);
     }
 
     final first = cards.first;
-    if (first.isPenaltyCard) {
-      final pending = cards.fold<int>(0, (sum, c) => sum + c.penaltyValue);
-      timeline.add(
-          '${player.name} started a penalty chain worth $pending card(s).');
-      nextState = nextState.copyWith(
-        penaltyState: PenaltyState(
-          pendingDraw: pending,
-          stack: List<KadiCard>.from(cards),
-        ),
-        statusMessage:
-            'Pending draw $pending. Next player must continue penalty or pick.',
+
+    final forcedRequest = ruleState.aceRequest;
+    if (forcedRequest != null) {
+      final isRequiredPlayer = player.uid != forcedRequest.requesterId;
+      final matchesRequest =
+          first.rank == forcedRequest.rank && first.suit == forcedRequest.suit;
+      final cancelsWithAce = first.rank == Rank.ace;
+      if (isRequiredPlayer && !matchesRequest && !cancelsWithAce) {
+        return RuleOutcome.invalid(
+          ruleState,
+          'Play ${forcedRequest.rank.label}${_describeSuit(forcedRequest.suit)} or cancel with an Ace.',
+        );
+      }
+    }
+
+    if (ruleState.pendingDraw > 0 && !first.isPenaltyCard && !first.isAce) {
+      return RuleOutcome.invalid(
+        ruleState,
+        'Continue the penalty with 2, 3, or Joker or cancel it with an Ace.',
       );
-      return _completeTurn(nextState);
     }
 
     if (first.isAceOfSpades) {
-      final payload = ctx.intent.aceRequest!;
-      final targetIndex = nextState.advanceIndex(1);
-      final target = nextState.players[targetIndex];
-      timeline.add(
-          '${player.name} requested ${payload.label} from ${target.name}.');
-      nextState = nextState.copyWith(
-        penaltyState: const PenaltyState(),
-        aceRequest: AceRequest(
-          suit: payload.suit,
-          rank: payload.rank,
-          requestedBy: player.uid,
-          targetPlayer: target.uid,
-        ),
-        requiredSuit: null,
-        statusMessage:
-            '${target.name}, play ${payload.label} or draw 1 if unavailable.',
-      );
-      return _completeTurn(nextState);
+      return _handleAceOfSpades(ruleState, player, cards, aceRequest);
     }
-
     if (first.isAce) {
-      timeline.add('${player.name} changed suit to ${first.suit.label}.');
-      nextState = nextState.copyWith(
-        penaltyState: const PenaltyState(),
-        requiredSuit: first.suit,
-        statusMessage: 'Play continues in ${first.suit.label}.',
-      );
-      return _completeTurn(nextState);
+      return _handleOtherAce(ruleState, player, cards);
     }
-
-    if (first.isSkip) {
-      final skipCount = cards.length;
-      final expires = DateTime.now().add(const Duration(seconds: 10));
-      final targetIndex = nextState.advanceIndex(1);
-      timeline.add('${player.name} jumped $skipCount player(s).');
-      nextState = nextState.copyWith(
-        cancelWindow: CancelWindow(
-          type: CancelType.jump,
-          initiatedBy: player.uid,
-          expiresAt: expires,
-          effectCount: skipCount,
-          targetTurnIndex: targetIndex,
-        ),
-        statusMessage:
-            'Jump in effect. Any player may cancel with a Jack within 10s.',
-      );
-      return _completeTurn(nextState);
+    if (first.isPenaltyCard) {
+      return _handlePenalty(ruleState, player, cards, top);
     }
-
-    if (first.isReverse) {
-      final reversals = cards.length;
-      final expires = DateTime.now().add(const Duration(seconds: 10));
-      timeline.add('${player.name} triggered a kickback.');
-      nextState = nextState.copyWith(
-        cancelWindow: CancelWindow(
-          type: CancelType.kick,
-          initiatedBy: player.uid,
-          expiresAt: expires,
-          effectCount: reversals,
-          targetTurnIndex: nextState.advanceIndex(1),
-        ),
-        statusMessage:
-            'Kickback pending. Any player may cancel with a King within 10s.',
-      );
-      return _completeTurn(nextState);
-    }
-
     if (first.isQuestionCard) {
-      final answerRank = cards
-          .skipWhile((c) => c.rank == first.rank)
-          .map((c) => c.rank.label)
-          .first;
-      timeline.add(
-          '${player.name} asked with ${first.rank.label}s and answered with ${answerRank}s.');
-      return _completeTurn(nextState);
+      return _handleQuestion(ruleState, player, cards, top);
     }
-
-    final comboRank = first.rank.label;
-    if (cards.length > 1) {
-      timeline.add('${player.name} played a $comboRank combo.');
-    } else {
-      timeline.add('${player.name} played ${first.rank.label}${first.suit.label[0]}.');
+    if (first.isSkip) {
+      return _handleJump(ruleState, player, cards, top);
     }
-
-    return _completeTurn(nextState);
+    if (first.rank == Rank.king) {
+      return _handleKick(ruleState, player, cards, top);
+    }
+    return _handleOrdinary(ruleState, player, cards, top);
   }
 
-  GameState _completeTurn(GameState state) {
-    final nextIndex = state.advanceIndex(1);
-    return state.copyWith(
-      turnIndex: nextIndex,
-      requiredSuit: state.requiredSuit,
+  RuleOutcome applyJumpExpiry(GameState game) {
+    final state = RuleState.fromGame(game);
+    final window = state.jumpWindow;
+    if (window == null) {
+      return RuleOutcome.invalid(state, 'No jump pending.');
+    }
+    if (DateTime.now().isBefore(window.expiresAt)) {
+      return RuleOutcome.invalid(state, 'Jump cancel window still active.');
+    }
+    final updated = state.copyWith(
+      skipCount: window.skipCount,
+      jumpWindow: null,
     );
+    final count = window.skipCount;
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: [
+        'Jump stands – skipping $count ${count == 1 ? 'person' : 'people'}.',
+      ],
+      instruction: 'Skip $count ${count == 1 ? 'player' : 'players'} then play.',
+      advanceTurn: true,
+    );
+  }
+
+  RuleOutcome applyKickExpiry(GameState game) {
+    final state = RuleState.fromGame(game);
+    final window = state.kickWindow;
+    if (window == null) {
+      return RuleOutcome.invalid(state, 'No kickback pending.');
+    }
+    if (DateTime.now().isBefore(window.expiresAt)) {
+      return RuleOutcome.invalid(state, 'Kickback cancel window still active.');
+    }
+    var direction = state.clockwise;
+    for (var i = 0; i < window.toggleCount; i++) {
+      direction = !direction;
+    }
+    final updated = state.copyWith(
+      clockwise: direction,
+      kickWindow: null,
+    );
+    final toggles = window.toggleCount;
+    final descriptor = direction ? 'clockwise' : 'counterclockwise';
+    final outcomeDescription = toggles.isOdd
+        ? 'direction reversed'
+        : 'direction unchanged';
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: [
+        'Kickback stands – $outcomeDescription.',
+      ],
+      instruction: 'Play continues $descriptor.',
+      advanceTurn: true,
+    );
+  }
+
+  static bool winningHand(List<KadiCard> hand) {
+    if (hand.isEmpty) return false;
+    return hand.every((card) => _ordinaryRanks.contains(card.rank));
+  }
+
+  RuleOutcome _handleJumpCancel(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+  ) {
+    final window = state.jumpWindow!;
+    if (cards.length != 1 || !cards.first.isSkip) {
+      return RuleOutcome.invalid(
+        state,
+        'Only a single J may cancel the jump.',
+      );
+    }
+    if (player.uid == window.initiatorId) {
+      return RuleOutcome.invalid(
+        state,
+        'You cannot cancel your own jump.',
+      );
+    }
+    final updated = state.copyWith(
+      jumpWindow: null,
+      skipCount: 0,
+    );
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: ['${player.name} canceled the jump.'],
+      instruction: 'Play continues from ${_describeCard(cards.first)}.',
+      advanceTurn: true,
+    );
+  }
+
+  RuleOutcome _handleKickCancel(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+  ) {
+    final window = state.kickWindow!;
+    if (cards.length != 1 || cards.first.rank != Rank.king) {
+      return RuleOutcome.invalid(
+        state,
+        'Only a single K may cancel the kickback.',
+      );
+    }
+    if (player.uid == window.initiatorId) {
+      return RuleOutcome.invalid(
+        state,
+        'You cannot cancel your own kickback.',
+      );
+    }
+    final updated = state.copyWith(
+      kickWindow: null,
+    );
+    final descriptor = state.clockwise ? 'clockwise' : 'counterclockwise';
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: ['${player.name} canceled the kickback.'],
+      instruction: 'Direction stays $descriptor.',
+      advanceTurn: true,
+    );
+  }
+
+  RuleOutcome _handleAceOfSpades(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+    AceRequest? request,
+  ) {
+    if (cards.length != 1) {
+      return RuleOutcome.invalid(state, 'A♠ must be played alone.');
+    }
+    if (request == null) {
+      return RuleOutcome.invalid(
+        state,
+        'Declare the exact card for the Ace of Spades.',
+      );
+    }
+    final updated = state.copyWith(
+      pendingDraw: 0,
+      penaltyStarterId: null,
+      forcedSuit: null,
+      aceRequest: AceRequest(
+        requesterId: player.uid,
+        rank: request.rank,
+        suit: request.suit,
+      ),
+    );
+    final label = '${request.rank.label}${_describeSuit(request.suit)}';
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: [
+        '${player.name} canceled penalties with A♠ and requested $label.',
+      ],
+      instruction: 'Next player must play $label or draw 1 card.',
+    );
+  }
+
+  RuleOutcome _handleOtherAce(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+  ) {
+    if (cards.length != 1) {
+      return RuleOutcome.invalid(state, 'Aces cannot be combined.');
+    }
+    final card = cards.first;
+    final clearsPenalty = state.pendingDraw > 0;
+    final clearsRequest = state.aceRequest != null;
+    final updated = state.copyWith(
+      pendingDraw: 0,
+      penaltyStarterId: null,
+      forcedSuit: card.suit,
+      aceRequest: null,
+    );
+    final timeline = <String>[];
+    if (clearsPenalty) {
+      timeline.add('${player.name} canceled the penalty.');
+    }
+    if (clearsRequest) {
+      timeline.add('${player.name} canceled the request.');
+    }
+    if (timeline.isEmpty) {
+      timeline.add('${player.name} changed suit to ${_describeSuit(card.suit)}.');
+    } else {
+      timeline.add('${player.name} set play to ${_describeSuit(card.suit)}.');
+    }
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: timeline,
+      instruction: 'Next player must follow ${_describeSuit(card.suit)} or play an Ace.',
+    );
+  }
+
+  RuleOutcome _handlePenalty(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+    KadiCard top,
+  ) {
+    if (!_validPenaltySequence(state, top, cards)) {
+      return RuleOutcome.invalid(
+        state,
+        'Penalty cards must match by suit, rank, or joker colour.',
+      );
+    }
+    var total = state.pendingDraw;
+    for (final card in cards) {
+      total += card.penaltyValue;
+    }
+    final updated = state.copyWith(
+      pendingDraw: total,
+      penaltyStarterId: state.penaltyStarterId ?? player.uid,
+      forcedSuit: null,
+      aceRequest: null,
+    );
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: [
+        '${player.name} stacked penalty to +$total.',
+      ],
+      instruction:
+          'Next player must add to the penalty or draw $total ${total == 1 ? 'card' : 'cards'}.',
+    );
+  }
+
+  RuleOutcome _handleQuestion(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+    KadiCard top,
+  ) {
+    if (state.pendingDraw > 0) {
+      return RuleOutcome.invalid(
+        state,
+        'Resolve penalties before asking questions.',
+      );
+    }
+    final queue = Queue<KadiCard>.of(cards);
+    final questions = <KadiCard>[];
+    final answers = <KadiCard>[];
+    while (queue.isNotEmpty) {
+      final card = queue.removeFirst();
+      if (card.isQuestionCard && answers.isEmpty) {
+        questions.add(card);
+      } else {
+        answers.add(card);
+      }
+    }
+    if (questions.isEmpty || answers.isEmpty) {
+      return RuleOutcome.invalid(
+        state,
+        'Question cards must be followed by answers in the same play.',
+      );
+    }
+    if (!_allSameRank(questions)) {
+      return RuleOutcome.invalid(
+        state,
+        'Combine questions of the same rank only.',
+      );
+    }
+    final firstQuestion = questions.first;
+    if (!_matchesTop(firstQuestion, top, state.forcedSuit)) {
+      return RuleOutcome.invalid(
+        state,
+        'First question must match pile by suit or rank.',
+      );
+    }
+    final firstAnswer = answers.first;
+    if (!_ordinaryRanks.contains(firstAnswer.rank)) {
+      return RuleOutcome.invalid(
+        state,
+        'Answers must be ordinary cards.',
+      );
+    }
+    if (firstAnswer.suit != questions.last.suit) {
+      return RuleOutcome.invalid(
+        state,
+        'First answer must follow the suit of the last question.',
+      );
+    }
+    if (!_allSameRank(answers)) {
+      return RuleOutcome.invalid(
+        state,
+        'All answers must share the same rank.',
+      );
+    }
+    final answerRank = answers.first.rank;
+    for (final card in answers) {
+      if (!_ordinaryRanks.contains(card.rank) || card.rank != answerRank) {
+        return RuleOutcome.invalid(
+          state,
+          'Answers must repeat the chosen ordinary rank.',
+        );
+      }
+    }
+    final updated = state.copyWith(
+      forcedSuit: null,
+      aceRequest: null,
+    );
+    final questionLabel = questions.map(_describeCard).join(', ');
+    final answerLabel = answers.map(_describeCard).join(', ');
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: [
+        '${player.name} played $questionLabel and answered with $answerLabel.',
+      ],
+      instruction: null,
+    );
+  }
+
+  RuleOutcome _handleJump(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+    KadiCard top,
+  ) {
+    if (state.pendingDraw > 0) {
+      return RuleOutcome.invalid(
+        state,
+        'Finish the penalty chain before jumping.',
+      );
+    }
+    if (cards.any((card) => !card.isSkip)) {
+      return RuleOutcome.invalid(
+        state,
+        'Jump combos may only contain Js.',
+      );
+    }
+    if (!_matchesTop(cards.first, top, state.forcedSuit)) {
+      return RuleOutcome.invalid(
+        state,
+        'J must match the pile by suit or rank.',
+      );
+    }
+    final skipCount = cards.length;
+    final window = JumpWindow(
+      initiatorId: player.uid,
+      skipCount: skipCount,
+      expiresAt: DateTime.now().add(const Duration(seconds: 10)),
+    );
+    final updated = state.copyWith(
+      jumpWindow: window,
+      skipCount: 0,
+      forcedSuit: null,
+      aceRequest: null,
+    );
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: [
+        '${player.name} jumped $skipCount ${skipCount == 1 ? 'person' : 'people'}.',
+      ],
+      instruction: 'Any player may cancel with a J within 10 seconds.',
+      advanceTurn: false,
+      startJumpTimer: true,
+    );
+  }
+
+  RuleOutcome _handleKick(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+    KadiCard top,
+  ) {
+    if (state.pendingDraw > 0) {
+      return RuleOutcome.invalid(
+        state,
+        'Finish the penalty chain before reversing direction.',
+      );
+    }
+    if (cards.any((card) => card.rank != Rank.king)) {
+      return RuleOutcome.invalid(
+        state,
+        'Kickback combos may only contain Ks.',
+      );
+    }
+    if (!_matchesTop(cards.first, top, state.forcedSuit)) {
+      return RuleOutcome.invalid(
+        state,
+        'K must match the pile by suit or rank.',
+      );
+    }
+    final toggles = cards.length;
+    final window = KickWindow(
+      initiatorId: player.uid,
+      toggleCount: toggles,
+      expiresAt: DateTime.now().add(const Duration(seconds: 10)),
+    );
+    final updated = state.copyWith(
+      kickWindow: window,
+      forcedSuit: null,
+      aceRequest: null,
+    );
+    final countLabel =
+        '$toggles ${toggles == 1 ? 'time' : 'times'}';
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: [
+        '${player.name} triggered a kickback $countLabel.',
+      ],
+      instruction: 'Any player may cancel with a K within 10 seconds.',
+      advanceTurn: false,
+      startKickTimer: true,
+    );
+  }
+
+  RuleOutcome _handleOrdinary(
+    RuleState state,
+    KadiPlayer player,
+    List<KadiCard> cards,
+    KadiCard top,
+  ) {
+    if (!_matchesTop(cards.first, top, state.forcedSuit)) {
+      return RuleOutcome.invalid(
+        state,
+        'First card must match the pile by suit or rank.',
+      );
+    }
+    if (!_allSameRank(cards)) {
+      return RuleOutcome.invalid(
+        state,
+        'Ordinary combos must share the same rank.',
+      );
+    }
+    for (final card in cards) {
+      if (!_ordinaryRanks.contains(card.rank)) {
+        return RuleOutcome.invalid(
+          state,
+          'Use ranks 4,5,6,7,9,10 for ordinary plays.',
+        );
+      }
+    }
+    final updated = state.copyWith(
+      forcedSuit: null,
+      aceRequest: null,
+    );
+    return RuleOutcome.valid(
+      state: updated,
+      timeline: const [],
+      instruction: null,
+    );
+  }
+
+  bool _validPenaltySequence(
+    RuleState state,
+    KadiCard top,
+    List<KadiCard> cards,
+  ) {
+    if (cards.any((card) => !_penaltyRanks.contains(card.rank))) {
+      return false;
+    }
+    final sequence = Queue<KadiCard>.of(cards);
+    var reference = top;
+    var forcedSuit = state.forcedSuit;
+    while (sequence.isNotEmpty) {
+      final card = sequence.removeFirst();
+      if (!_penaltyMatches(card, reference, forcedSuit)) {
+        return false;
+      }
+      reference = card;
+      forcedSuit = null;
+    }
+    return true;
+  }
+
+  bool _penaltyMatches(KadiCard card, KadiCard reference, Suit? forcedSuit) {
+    if (forcedSuit != null) {
+      if (card.isJoker) {
+        return _jokerMatchesSuit(card.color, forcedSuit);
+      }
+      return card.suit == forcedSuit;
+    }
+    if (reference.isJoker) {
+      if (card.isJoker) {
+        return card.color == reference.color;
+      }
+      return _jokerMatchesSuit(reference.color, card.suit);
+    }
+    if (card.isJoker) {
+      return _jokerMatchesSuit(card.color, reference.suit);
+    }
+    return card.rank == reference.rank || card.suit == reference.suit;
+  }
+
+  bool _jokerMatchesSuit(CardColor color, Suit suit) {
+    switch (suit) {
+      case Suit.hearts:
+      case Suit.diamonds:
+        return color == CardColor.red;
+      case Suit.clubs:
+      case Suit.spades:
+        return color == CardColor.black;
+      case Suit.joker:
+        return true;
+    }
+  }
+
+  bool _matchesTop(KadiCard card, KadiCard top, Suit? forcedSuit) {
+    if (forcedSuit != null) {
+      if (card.isJoker) {
+        return _jokerMatchesSuit(card.color, forcedSuit);
+      }
+      return card.suit == forcedSuit || card.rank == Rank.ace;
+    }
+    if (card.isJoker) return true;
+    if (top.isJoker) {
+      return _jokerMatchesSuit(card.color, top.suit) || card.rank == top.rank;
+    }
+    return card.suit == top.suit || card.rank == top.rank;
+  }
+
+  bool _allSameRank(List<KadiCard> cards) {
+    if (cards.isEmpty) return true;
+    final rank = cards.first.rank;
+    return cards.every((card) => card.rank == rank);
   }
 }
